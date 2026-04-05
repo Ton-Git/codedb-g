@@ -224,6 +224,8 @@ fn writeLanguages(writer: anytype, language_mask: u16) !void {
         "typescript",
         "rust",
         "go_lang",
+        "php",
+        "java",
         "markdown",
         "json",
         "yaml",

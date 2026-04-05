@@ -879,6 +879,124 @@ test "explorer: typescript parser" {
     try testing.expect(outline.symbols.items.len >= 3);
 }
 
+test "explorer: java parser detects imports class methods and constants" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/Main.java",
+        \\package com.acme;
+        \\
+        \\import java.util.List;
+        \\import static com.acme.util.Constants.PORT;
+        \\
+        \\public class Main {
+        \\    private static final int PORT = 8080;
+        \\
+        \\    public Main() {}
+        \\    public void run() {}
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/Main.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try testing.expect(outline.language == .java);
+    try testing.expectEqual(@as(usize, 2), outline.imports.items.len);
+    try testing.expectEqualStrings("java/util/List.java", outline.imports.items[0]);
+    try testing.expectEqualStrings("com/acme/util/Constants.java", outline.imports.items[1]);
+
+    var import_count: usize = 0;
+    var class_count: usize = 0;
+    var method_count: usize = 0;
+    var constant_count: usize = 0;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .import) import_count += 1;
+        if (sym.kind == .class_def and std.mem.eql(u8, sym.name, "Main")) class_count += 1;
+        if (sym.kind == .method and (std.mem.eql(u8, sym.name, "Main") or std.mem.eql(u8, sym.name, "run"))) method_count += 1;
+        if (sym.kind == .constant and std.mem.eql(u8, sym.name, "PORT")) constant_count += 1;
+    }
+
+    try testing.expectEqual(@as(usize, 2), import_count);
+    try testing.expectEqual(@as(usize, 1), class_count);
+    try testing.expectEqual(@as(usize, 2), method_count);
+    try testing.expectEqual(@as(usize, 1), constant_count);
+}
+
+test "explorer: java parser handles records interfaces annotations and nested classes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/Types.java",
+        \\public sealed interface Worker permits DefaultWorker {}
+        \\public enum Status { READY; }
+        \\public record User(String id) {}
+        \\public @interface Marker {}
+        \\public class Outer {
+        \\    static class Inner {}
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/Types.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    var found_worker = false;
+    var found_status = false;
+    var found_user = false;
+    var found_marker = false;
+    var found_outer = false;
+    var found_inner = false;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .interface_def and std.mem.eql(u8, sym.name, "Worker")) found_worker = true;
+        if (sym.kind == .enum_def and std.mem.eql(u8, sym.name, "Status")) found_status = true;
+        if (sym.kind == .class_def and std.mem.eql(u8, sym.name, "User")) found_user = true;
+        if (sym.kind == .interface_def and std.mem.eql(u8, sym.name, "Marker")) found_marker = true;
+        if (sym.kind == .class_def and std.mem.eql(u8, sym.name, "Outer")) found_outer = true;
+        if (sym.kind == .class_def and std.mem.eql(u8, sym.name, "Inner")) found_inner = true;
+    }
+
+    try testing.expect(found_worker);
+    try testing.expect(found_status);
+    try testing.expect(found_user);
+    try testing.expect(found_marker);
+    try testing.expect(found_outer);
+    try testing.expect(found_inner);
+}
+
+test "explorer: java parser ignores comments and leading annotations" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/Annotated.java",
+        \\// class Fake {}
+        \\/*
+        \\interface Ghost {}
+        \\*/
+        \\@Deprecated
+        \\public class Annotated {
+        \\    @Override public String toString() {
+        \\        return "}";
+        \\    }
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/Annotated.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    var class_count: usize = 0;
+    var method_count: usize = 0;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .class_def and std.mem.eql(u8, sym.name, "Annotated")) class_count += 1;
+        if (sym.kind == .method and std.mem.eql(u8, sym.name, "toString")) method_count += 1;
+    }
+
+    try testing.expectEqual(@as(usize, 1), class_count);
+    try testing.expectEqual(@as(usize, 1), method_count);
+    try testing.expectEqual(@as(usize, 2), outline.symbols.items.len);
+}
+
 // ── Version tests ───────────────────────────────────────────
 
 test "file versions: append and latest" {
@@ -1864,6 +1982,13 @@ test "isCommentOrBlank: cpp block and line comments" {
     try testing.expect(!isCommentOrBlank("  int x = 0;", .cpp));
 }
 
+test "isCommentOrBlank: java comments" {
+    try testing.expect(isCommentOrBlank("  // java line comment", .java));
+    try testing.expect(isCommentOrBlank("  /* java block comment */", .java));
+    try testing.expect(isCommentOrBlank("  * java continued block comment", .java));
+    try testing.expect(!isCommentOrBlank("  public class Main {", .java));
+}
+
 test "isCommentOrBlank: tabs and mixed whitespace" {
     try testing.expect(isCommentOrBlank("\t\t// tabbed comment", .zig));
     try testing.expect(isCommentOrBlank(" \t \t ", .zig));
@@ -2020,6 +2145,7 @@ test "detectLanguage: all supported extensions" {
     try testing.expect(explore.detectLanguage("comp.tsx") == .typescript);
     try testing.expect(explore.detectLanguage("main.rs") == .rust);
     try testing.expect(explore.detectLanguage("main.go") == .go_lang);
+    try testing.expect(explore.detectLanguage("Main.java") == .java);
     try testing.expect(explore.detectLanguage("README.md") == .markdown);
     try testing.expect(explore.detectLanguage("pkg.json") == .json);
     try testing.expect(explore.detectLanguage("config.yaml") == .yaml);
@@ -3529,6 +3655,8 @@ test "issue-59: telemetry writes session, tool, and codebase stats ndjson" {
     defer explorer.deinit();
     try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
     try explorer.indexFile("src/lib.py", "def run():\n    return 1\n");
+    try explorer.indexFile("src/App.php", "<?php\nclass App {}\n");
+    try explorer.indexFile("src/Main.java", "public class Main {}\n");
 
     telem.recordCodebaseStats(&explorer, 42);
     telem.flush();
@@ -3544,7 +3672,7 @@ test "issue-59: telemetry writes session, tool, and codebase stats ndjson" {
     try testing.expect(std.mem.indexOf(u8, contents, "\"tool\":\"codedb_status\"") != null);
     try testing.expect(std.mem.indexOf(u8, contents, "\"event_type\":\"codebase_stats\"") != null);
     try testing.expect(std.mem.indexOf(u8, contents, "\"startup_time_ms\":42") != null);
-    try testing.expect(std.mem.indexOf(u8, contents, "\"languages\":[\"zig\",\"python\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "\"languages\":[\"zig\",\"python\",\"php\",\"java\"]") != null);
 }
 
 test "issue-60: telemetry disabled path is a no-op" {

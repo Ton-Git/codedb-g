@@ -21,6 +21,7 @@ pub const Style = struct {
         if (std.mem.eql(u8, lang, "javascript")) return self.yellow;
         if (std.mem.eql(u8, lang, "go_lang")) return self.cyan;
         if (std.mem.eql(u8, lang, "rust")) return self.orange;
+        if (std.mem.eql(u8, lang, "java")) return self.orange;
         if (std.mem.eql(u8, lang, "python")) return self.blue;
         if (std.mem.eql(u8, lang, "c") or std.mem.eql(u8, lang, "cpp")) return self.blue;
         if (std.mem.eql(u8, lang, "markdown")) return self.dim;
