@@ -74,6 +74,7 @@ pub const Language = enum(u8) {
     rust,
     go_lang,
     php,
+    java,
     markdown,
     json,
     yaml,
@@ -90,6 +91,7 @@ pub fn detectLanguage(path: []const u8) Language {
     if (std.mem.endsWith(u8, path, ".rs")) return .rust;
     if (std.mem.endsWith(u8, path, ".go")) return .go_lang;
     if (std.mem.endsWith(u8, path, ".php")) return .php;
+    if (std.mem.endsWith(u8, path, ".java")) return .java;
     if (std.mem.endsWith(u8, path, ".md")) return .markdown;
     if (std.mem.endsWith(u8, path, ".json")) return .json;
     if (std.mem.endsWith(u8, path, ".yaml") or std.mem.endsWith(u8, path, ".yml")) return .yaml;
@@ -202,6 +204,8 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
     var line_num: u32 = 0;
     var prev_line_trimmed: []const u8 = "";
     var php_state: PhpParseState = .{};
+    var java_state: JavaParseState = .{};
+    defer java_state.deinit(self.allocator);
     var in_py_docstring = false;
     var in_block_comment = false;
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -249,6 +253,8 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
             try self.parseRustLine(trimmed, line_num, &outline, prev_line_trimmed);
         } else if (outline.language == .php) {
             try self.parsePhpLine(trimmed, line_num, &outline, &php_state);
+        } else if (outline.language == .java) {
+            try self.parseJavaLine(trimmed, line_num, &outline, &java_state);
         }
 
         prev_line_trimmed = trimmed;
@@ -1341,6 +1347,359 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
         return null;
     }
 
+    const JavaTypeContext = struct {
+        name: []const u8,
+        depth: i32,
+        kind: SymbolKind,
+    };
+
+    const JavaParseState = struct {
+        in_block_comment: bool = false,
+        in_text_block: bool = false,
+        brace_depth: i32 = 0,
+        type_stack: std.ArrayListUnmanaged(JavaTypeContext) = .{},
+        pending_type_name: ?[]const u8 = null,
+        pending_decl: std.ArrayListUnmanaged(u8) = .{},
+        pending_decl_start_line: ?u32 = null,
+
+        fn deinit(self: *JavaParseState, allocator: std.mem.Allocator) void {
+            for (self.type_stack.items) |ctx| allocator.free(ctx.name);
+            self.type_stack.deinit(allocator);
+            if (self.pending_type_name) |name| allocator.free(name);
+            self.pending_decl.deinit(allocator);
+        }
+
+        fn currentTypeName(self: *const JavaParseState) ?[]const u8 {
+            if (self.type_stack.items.len == 0) return null;
+            return self.type_stack.items[self.type_stack.items.len - 1].name;
+        }
+
+        fn currentTypeKind(self: *const JavaParseState) ?SymbolKind {
+            if (self.type_stack.items.len == 0) return null;
+            return self.type_stack.items[self.type_stack.items.len - 1].kind;
+        }
+
+        fn currentTypeDepth(self: *const JavaParseState) ?i32 {
+            if (self.type_stack.items.len == 0) return null;
+            return self.type_stack.items[self.type_stack.items.len - 1].depth;
+        }
+
+        fn inType(self: *const JavaParseState) bool {
+            return self.type_stack.items.len > 0;
+        }
+
+        fn atTypeTopLevel(self: *const JavaParseState) bool {
+            const depth = self.currentTypeDepth() orelse return false;
+            return self.brace_depth == depth;
+        }
+
+        fn setPendingType(self: *JavaParseState, allocator: std.mem.Allocator, name: []const u8) !void {
+            if (self.pending_type_name) |old_name| allocator.free(old_name);
+            self.pending_type_name = try allocator.dupe(u8, name);
+        }
+
+        fn activatePendingType(self: *JavaParseState, allocator: std.mem.Allocator, kind: SymbolKind) !void {
+            const name = self.pending_type_name orelse return;
+            self.pending_type_name = null;
+            try self.type_stack.append(allocator, .{
+                .name = name,
+                .depth = self.brace_depth,
+                .kind = kind,
+            });
+        }
+
+        fn appendPendingDecl(self: *JavaParseState, allocator: std.mem.Allocator, line: []const u8, line_num: u32) !void {
+            if (self.pending_decl.items.len == 0) self.pending_decl_start_line = line_num;
+            if (self.pending_decl.items.len > 0) try self.pending_decl.append(allocator, ' ');
+            try self.pending_decl.appendSlice(allocator, line);
+        }
+
+        fn clearPendingDecl(self: *JavaParseState) void {
+            self.pending_decl.clearRetainingCapacity();
+            self.pending_decl_start_line = null;
+        }
+
+        fn popCompletedTypes(self: *JavaParseState, allocator: std.mem.Allocator) void {
+            while (self.type_stack.items.len > 0 and self.type_stack.items[self.type_stack.items.len - 1].depth > self.brace_depth) {
+                const ctx = self.type_stack.pop() orelse break;
+                allocator.free(ctx.name);
+            }
+        }
+    };
+
+    const JavaTypeMatch = struct {
+        name: []const u8,
+        kind: SymbolKind,
+    };
+
+    fn parseJavaLine(self: *Explorer, raw_line: []const u8, line_num: u32, outline: *FileOutline, state: *JavaParseState) !void {
+        const a = self.allocator;
+        var line = raw_line;
+        if (line.len == 0) return;
+
+        while (true) {
+            if (state.in_block_comment) {
+                if (std.mem.indexOf(u8, line, "*/")) |end| {
+                    state.in_block_comment = false;
+                    line = std.mem.trim(u8, line[end + 2 ..], " \t");
+                    if (line.len == 0) return;
+                    continue;
+                }
+                return;
+            }
+            if (startsWith(line, "/*")) {
+                if (std.mem.indexOf(u8, line, "*/")) |end| {
+                    line = std.mem.trim(u8, line[end + 2 ..], " \t");
+                    if (line.len == 0) return;
+                    continue;
+                }
+                state.in_block_comment = true;
+                return;
+            }
+            break;
+        }
+
+        if (startsWith(line, "//")) return;
+
+        if (startsWith(line, "package ")) {
+            try self.javaUpdateBraceState(line, state);
+            return;
+        }
+
+        if (startsWith(line, "import ")) {
+            try self.parseJavaImport(a, line, line_num, outline);
+            try self.javaUpdateBraceState(line, state);
+            return;
+        }
+
+        const should_buffer = state.pending_decl.items.len > 0 or javaShouldBufferDeclaration(line, state);
+        const decl_line = if (should_buffer) blk: {
+            try state.appendPendingDecl(a, line, line_num);
+            break :blk state.pending_decl.items;
+        } else line;
+        const decl_line_num = state.pending_decl_start_line orelse line_num;
+
+        if (self.javaMatchType(decl_line)) |match| {
+            const name_copy = try a.dupe(u8, match.name);
+            errdefer a.free(name_copy);
+            const detail_copy = try a.dupe(u8, decl_line);
+            errdefer a.free(detail_copy);
+            try outline.symbols.append(a, .{
+                .name = name_copy,
+                .kind = match.kind,
+                .line_start = decl_line_num,
+                .line_end = line_num,
+                .detail = detail_copy,
+            });
+            try state.setPendingType(a, match.name);
+            state.clearPendingDecl();
+        } else if (self.javaMatchConstant(decl_line, state)) |name| {
+            const name_copy = try a.dupe(u8, name);
+            errdefer a.free(name_copy);
+            const detail_copy = try a.dupe(u8, decl_line);
+            errdefer a.free(detail_copy);
+            try outline.symbols.append(a, .{
+                .name = name_copy,
+                .kind = .constant,
+                .line_start = decl_line_num,
+                .line_end = line_num,
+                .detail = detail_copy,
+            });
+            state.clearPendingDecl();
+        } else if (self.javaMatchMethod(decl_line, state)) |name| {
+            const name_copy = try a.dupe(u8, name);
+            errdefer a.free(name_copy);
+            const detail_copy = try a.dupe(u8, decl_line);
+            errdefer a.free(detail_copy);
+            const kind: SymbolKind = if (javaHasTestAnnotation(decl_line)) .test_decl else .method;
+            try outline.symbols.append(a, .{
+                .name = name_copy,
+                .kind = kind,
+                .line_start = decl_line_num,
+                .line_end = line_num,
+                .detail = detail_copy,
+            });
+            state.clearPendingDecl();
+        } else if (should_buffer and javaLineEndsDeclaration(line) and !javaShouldContinueBufferedDeclaration(state.pending_decl.items)) {
+            state.clearPendingDecl();
+        }
+
+        try self.javaUpdateBraceState(line, state);
+    }
+
+    fn parseJavaImport(_: *Explorer, a: std.mem.Allocator, line: []const u8, line_num: u32, outline: *FileOutline) !void {
+        const semi = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
+        const import_body = std.mem.trim(u8, line[7..semi], " \t");
+        if (import_body.len == 0) return;
+
+        const symbol_copy = try a.dupe(u8, line[0..semi]);
+        errdefer a.free(symbol_copy);
+        try outline.symbols.append(a, .{
+            .name = symbol_copy,
+            .kind = .import,
+            .line_start = line_num,
+            .line_end = line_num,
+        });
+
+        const path_copy = try javaImportToPath(a, import_body);
+        errdefer a.free(path_copy);
+        try outline.imports.append(a, path_copy);
+    }
+
+    fn javaMatchType(_: *Explorer, line: []const u8) ?JavaTypeMatch {
+        const stripped = javaStripLeadingAnnotationsAndModifiers(line);
+        const keywords = [_]struct { prefix: []const u8, kind: SymbolKind }{
+            .{ .prefix = "@interface ", .kind = .interface_def },
+            .{ .prefix = "interface ", .kind = .interface_def },
+            .{ .prefix = "enum ", .kind = .enum_def },
+            .{ .prefix = "class ", .kind = .class_def },
+            .{ .prefix = "record ", .kind = .class_def },
+        };
+        for (keywords) |kw| {
+            if (startsWith(stripped, kw.prefix)) {
+                if (extractIdent(stripped[kw.prefix.len..])) |name| {
+                    return .{ .name = name, .kind = kw.kind };
+                }
+            }
+        }
+        return null;
+    }
+
+    fn javaMatchConstant(_: *Explorer, line: []const u8, state: *const JavaParseState) ?[]const u8 {
+        if (!state.atTypeTopLevel()) return null;
+        const has_static_final = startsWith(line, "static final ") or
+            startsWith(line, "public static final ") or
+            startsWith(line, "protected static final ") or
+            startsWith(line, "private static final ") or
+            std.mem.indexOf(u8, line, " static final ") != null;
+
+        const is_interface_field = blk: {
+            if (state.currentTypeKind() != .interface_def) break :blk false;
+            if (std.mem.indexOfScalar(u8, line, '=') == null) break :blk false;
+            if (std.mem.indexOfScalar(u8, line, '(') != null) break :blk false;
+            const stripped = javaStripLeadingAnnotationsAndModifiers(line);
+            if (startsWith(stripped, "class ") or startsWith(stripped, "interface ") or startsWith(stripped, "enum ") or startsWith(stripped, "record ") or startsWith(stripped, "@interface ")) break :blk false;
+            break :blk true;
+        };
+        if (!has_static_final and !is_interface_field) return null;
+
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse std.mem.indexOfScalar(u8, line, ';') orelse return null;
+        const before = std.mem.trimRight(u8, line[0..eq], " \t");
+        const span = javaLastIdentifierSpan(before) orelse return null;
+        if (javaIsReservedWord(span.name)) return null;
+        return span.name;
+    }
+
+    fn javaMatchMethod(_: *Explorer, line: []const u8, state: *const JavaParseState) ?[]const u8 {
+        if (!state.atTypeTopLevel()) return null;
+        const stripped = javaStripLeadingAnnotationsAndModifiers(line);
+        if (stripped.len == 0) return null;
+        if (startsWith(stripped, "class ") or startsWith(stripped, "interface ") or startsWith(stripped, "enum ") or startsWith(stripped, "record ") or startsWith(stripped, "@interface ")) return null;
+
+        const paren = std.mem.indexOfScalar(u8, stripped, '(') orelse return null;
+        const before = std.mem.trimRight(u8, stripped[0..paren], " \t");
+        if (before.len == 0) return null;
+
+        const span = javaLastIdentifierSpan(before) orelse return null;
+        if (javaIsControlWord(span.name)) return null;
+        const prefix = std.mem.trimRight(u8, before[0..span.start], " \t");
+        if (prefix.len == 0) {
+            if (state.currentTypeName()) |current_name| {
+                if (std.mem.eql(u8, span.name, current_name)) return span.name;
+            }
+            return null;
+        }
+        if (javaIsMethodRejectPrefix(prefix)) return null;
+        return span.name;
+    }
+
+    fn javaUpdateBraceState(self: *Explorer, line: []const u8, state: *JavaParseState) !void {
+        var in_string: u8 = 0;
+        var escaped = false;
+        var i: usize = 0;
+        while (i < line.len) : (i += 1) {
+            const ch = line[i];
+            if (state.in_block_comment) {
+                if (ch == '*' and i + 1 < line.len and line[i + 1] == '/') {
+                    state.in_block_comment = false;
+                    i += 1;
+                }
+                continue;
+            }
+            if (state.in_text_block) {
+                if (ch == '"' and i + 2 < line.len and line[i + 1] == '"' and line[i + 2] == '"') {
+                    state.in_text_block = false;
+                    i += 2;
+                }
+                continue;
+            }
+            if (in_string != 0) {
+                if (escaped) {
+                    escaped = false;
+                } else if (ch == '\\') {
+                    escaped = true;
+                } else if (ch == in_string) {
+                    in_string = 0;
+                }
+                continue;
+            }
+            if (ch == '"' and i + 2 < line.len and line[i + 1] == '"' and line[i + 2] == '"') {
+                state.in_text_block = true;
+                i += 2;
+                continue;
+            }
+            if (ch == '"' or ch == '\'') {
+                in_string = ch;
+                continue;
+            }
+            if (ch == '/' and i + 1 < line.len) {
+                const next = line[i + 1];
+                if (next == '/') break;
+                if (next == '*') {
+                    state.in_block_comment = true;
+                    i += 1;
+                    continue;
+                }
+            }
+            if (ch == '{') {
+                state.brace_depth += 1;
+                if (state.pending_type_name != null) {
+                    const type_kind = if (self.javaMatchType(state.pending_decl.items)) |match|
+                        match.kind
+                    else if (self.javaMatchType(line)) |match|
+                        match.kind
+                    else
+                        .class_def;
+                    try state.activatePendingType(self.allocator, type_kind);
+                }
+            } else if (ch == '}') {
+                state.brace_depth -= 1;
+                state.popCompletedTypes(self.allocator);
+            }
+        }
+    }
+
+    fn javaImportToPath(allocator: std.mem.Allocator, import_body: []const u8) ![]u8 {
+        var path = std.mem.trim(u8, import_body, " \t");
+        if (startsWith(path, "static ")) {
+            path = std.mem.trimLeft(u8, path[7..], " \t");
+            if (std.mem.endsWith(u8, path, ".*")) return try allocator.dupe(u8, path);
+            if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot| {
+                path = path[0..dot];
+            }
+        } else if (std.mem.endsWith(u8, path, ".*")) {
+            return try allocator.dupe(u8, path);
+        }
+
+        var buf: std.ArrayList(u8) = .{};
+        errdefer buf.deinit(allocator);
+        for (path) |ch| {
+            try buf.append(allocator, if (ch == '.') '/' else ch);
+        }
+        try buf.appendSlice(allocator, ".java");
+        return try buf.toOwnedSlice(allocator);
+    }
+
 fn rebuildDepsFor(self: *Explorer, path: []const u8, outline: *FileOutline) !void {
     var deps: std.ArrayList([]const u8) = .{};
     errdefer deps.deinit(self.allocator);
@@ -1577,7 +1936,7 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
     return switch (language) {
         .zig, .rust, .go_lang => std.mem.startsWith(u8, trimmed, "//"),
         .python => std.mem.startsWith(u8, trimmed, "#"),
-        .javascript, .typescript, .c, .cpp => std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
+        .javascript, .typescript, .c, .cpp, .java => std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
         else => false,
     };
 }
@@ -1992,4 +2351,195 @@ fn extractPythonModulePath(line: []const u8) ?[]const u8 {
         return null;
     }
     return null;
+}
+
+const JavaIdentSpan = struct {
+    name: []const u8,
+    start: usize,
+};
+
+fn javaLastIdentifierSpan(s: []const u8) ?JavaIdentSpan {
+    if (s.len == 0) return null;
+    var end = s.len;
+    while (end > 0 and !(std.ascii.isAlphanumeric(s[end - 1]) or s[end - 1] == '_' or s[end - 1] == '$')) : (end -= 1) {}
+    if (end == 0) return null;
+
+    var start = end;
+    while (start > 0 and (std.ascii.isAlphanumeric(s[start - 1]) or s[start - 1] == '_' or s[start - 1] == '$')) : (start -= 1) {}
+    return .{
+        .name = s[start..end],
+        .start = start,
+    };
+}
+
+fn javaStripLeadingAnnotationsAndModifiers(line: []const u8) []const u8 {
+    const modifiers = [_][]const u8{
+        "public ",
+        "protected ",
+        "private ",
+        "abstract ",
+        "final ",
+        "static ",
+        "sealed ",
+        "non-sealed ",
+        "strictfp ",
+        "default ",
+        "synchronized ",
+        "native ",
+        "transient ",
+        "volatile ",
+    };
+
+    var rest = std.mem.trimLeft(u8, line, " \t");
+    while (rest.len > 0) {
+        if (startsWith(rest, "@interface ")) return rest;
+        if (rest[0] == '@') {
+            if (javaSkipLeadingAnnotation(rest)) |after_annotation| {
+                rest = std.mem.trimLeft(u8, after_annotation, " \t");
+                continue;
+            }
+        }
+
+        var matched_modifier = false;
+        for (modifiers) |modifier| {
+            if (startsWith(rest, modifier)) {
+                rest = std.mem.trimLeft(u8, rest[modifier.len..], " \t");
+                matched_modifier = true;
+                break;
+            }
+        }
+        if (!matched_modifier) break;
+    }
+    return rest;
+}
+
+fn javaSkipLeadingAnnotation(line: []const u8) ?[]const u8 {
+    if (line.len == 0 or line[0] != '@' or startsWith(line, "@interface ")) return null;
+
+    var i: usize = 1;
+    while (i < line.len and (std.ascii.isAlphanumeric(line[i]) or line[i] == '_' or line[i] == '.')) : (i += 1) {}
+    if (i == 1) return null;
+
+    if (i < line.len and line[i] == '(') {
+        var depth: usize = 1;
+        i += 1;
+        while (i < line.len and depth > 0) : (i += 1) {
+            if (line[i] == '(') {
+                depth += 1;
+            } else if (line[i] == ')') {
+                depth -= 1;
+            }
+        }
+        if (depth != 0) return null;
+    }
+
+    return line[i..];
+}
+
+fn javaIsControlWord(word: []const u8) bool {
+    const words = [_][]const u8{
+        "if",
+        "for",
+        "while",
+        "switch",
+        "catch",
+        "return",
+        "throw",
+        "new",
+        "case",
+        "do",
+        "try",
+        "else",
+    };
+    for (words) |candidate| {
+        if (std.mem.eql(u8, word, candidate)) return true;
+    }
+    return false;
+}
+
+fn javaIsReservedWord(word: []const u8) bool {
+    const words = [_][]const u8{
+        "class",
+        "interface",
+        "enum",
+        "record",
+        "package",
+        "import",
+        "static",
+        "final",
+        "public",
+        "protected",
+        "private",
+    };
+    for (words) |candidate| {
+        if (std.mem.eql(u8, word, candidate)) return true;
+    }
+    return false;
+}
+
+fn javaIsMethodRejectPrefix(prefix: []const u8) bool {
+    const trimmed = std.mem.trim(u8, prefix, " \t");
+    if (trimmed.len == 0) return false;
+    if (trimmed[trimmed.len - 1] == '.') return true;
+    if (std.mem.indexOfAny(u8, trimmed, "=:") != null) return true;
+    if (std.mem.indexOf(u8, trimmed, "->") != null or std.mem.indexOf(u8, trimmed, "::") != null) return true;
+    if (javaLastIdentifierSpan(trimmed)) |span| {
+        return javaIsControlWord(span.name);
+    }
+    return false;
+}
+
+fn javaShouldBufferDeclaration(line: []const u8, state: *const Explorer.JavaParseState) bool {
+    if (line.len == 0) return false;
+    if (state.in_text_block or state.in_block_comment) return false;
+    if (startsWith(line, "@") and !startsWith(line, "@interface ")) return true;
+
+    const stripped = javaStripLeadingAnnotationsAndModifiers(line);
+    if (state.pending_decl.items.len > 0) return true;
+
+    if (std.mem.indexOfScalar(u8, line, '(') != null and std.mem.indexOfAny(u8, line, "{;") == null) return true;
+    if (std.mem.indexOfScalar(u8, stripped, '=') != null and std.mem.indexOfAny(u8, line, "{;") == null) return true;
+    if (startsWith(stripped, "class ") or startsWith(stripped, "interface ") or startsWith(stripped, "enum ") or startsWith(stripped, "record ") or startsWith(stripped, "@interface ")) {
+        return std.mem.indexOfScalar(u8, line, '{') == null;
+    }
+
+    if (state.inType()) {
+        if (std.mem.indexOfScalar(u8, line, '(') == null and std.mem.indexOfAny(u8, line, "{;=") == null) return true;
+        if (std.mem.indexOfScalar(u8, line, '(') != null and std.mem.indexOfAny(u8, line, "{;") == null) return true;
+    }
+
+    return false;
+}
+
+fn javaLineEndsDeclaration(line: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, line, '{') != null and std.mem.indexOf(u8, line, "\"\"\"") == null) return true;
+    return std.mem.indexOfScalar(u8, line, ';') != null;
+}
+
+fn javaShouldContinueBufferedDeclaration(buffer: []const u8) bool {
+    const trimmed = std.mem.trimRight(u8, buffer, " \t");
+    if (trimmed.len == 0) return false;
+    const annotation_pos = std.mem.lastIndexOfScalar(u8, trimmed, '@') orelse return false;
+    const tail = trimmed[annotation_pos..];
+    if (std.mem.indexOfScalar(u8, tail, '(') != null and std.mem.indexOfScalar(u8, tail, ')') == null) return true;
+    if (std.mem.indexOfAny(u8, tail, "{;") == null) return true;
+    return false;
+}
+
+fn javaHasTestAnnotation(line: []const u8) bool {
+    if (std.mem.indexOf(u8, line, "@org.junit.jupiter.") != null) return true;
+    if (std.mem.indexOf(u8, line, "@org.junit.") != null) return true;
+
+    const annotations = [_][]const u8{
+        "@ParameterizedTest",
+        "@RepeatedTest",
+        "@TestFactory",
+        "@TestTemplate",
+        "@Property",
+        "@Test",
+    };
+    for (annotations) |annotation| {
+        if (std.mem.indexOf(u8, line, annotation) != null) return true;
+    }
+    return false;
 }

@@ -879,6 +879,367 @@ test "explorer: typescript parser" {
     try testing.expect(outline.symbols.items.len >= 3);
 }
 
+test "explorer: java parser detects imports, classes, methods, and constants" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/Main.java",
+        \\package com.acme;
+        \\
+        \\import java.util.List;
+        \\import static com.acme.util.Constants.PORT;
+        \\
+        \\public class Main {
+        \\    private static final int PORT = 8080;
+        \\
+        \\    public Main() {}
+        \\    public void run() {}
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/Main.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try testing.expect(outline.language == .java);
+    try testing.expectEqual(@as(usize, 2), outline.imports.items.len);
+    try testing.expectEqualStrings("java/util/List.java", outline.imports.items[0]);
+    try testing.expectEqualStrings("com/acme/util/Constants.java", outline.imports.items[1]);
+
+    var import_count: usize = 0;
+    var class_count: usize = 0;
+    var method_count: usize = 0;
+    var constant_count: usize = 0;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .import) import_count += 1;
+        if (sym.kind == .class_def and std.mem.eql(u8, sym.name, "Main")) class_count += 1;
+        if (sym.kind == .method and (std.mem.eql(u8, sym.name, "Main") or std.mem.eql(u8, sym.name, "run"))) method_count += 1;
+        if (sym.kind == .constant and std.mem.eql(u8, sym.name, "PORT")) constant_count += 1;
+    }
+
+    try testing.expectEqual(@as(usize, 2), import_count);
+    try testing.expectEqual(@as(usize, 1), class_count);
+    try testing.expectEqual(@as(usize, 2), method_count);
+    try testing.expectEqual(@as(usize, 1), constant_count);
+}
+
+test "explorer: java parser handles records interfaces annotations and nested classes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/Types.java",
+        \\public sealed interface Worker permits DefaultWorker {}
+        \\public enum Status { READY; }
+        \\public record User(String id) {}
+        \\public @interface Marker {}
+        \\public class Outer {
+        \\    static class Inner {}
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/Types.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    var found_worker = false;
+    var found_status = false;
+    var found_user = false;
+    var found_marker = false;
+    var found_outer = false;
+    var found_inner = false;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .interface_def and std.mem.eql(u8, sym.name, "Worker")) found_worker = true;
+        if (sym.kind == .enum_def and std.mem.eql(u8, sym.name, "Status")) found_status = true;
+        if (sym.kind == .class_def and std.mem.eql(u8, sym.name, "User")) found_user = true;
+        if (sym.kind == .interface_def and std.mem.eql(u8, sym.name, "Marker")) found_marker = true;
+        if (sym.kind == .class_def and std.mem.eql(u8, sym.name, "Outer")) found_outer = true;
+        if (sym.kind == .class_def and std.mem.eql(u8, sym.name, "Inner")) found_inner = true;
+    }
+
+    try testing.expect(found_worker);
+    try testing.expect(found_status);
+    try testing.expect(found_user);
+    try testing.expect(found_marker);
+    try testing.expect(found_outer);
+    try testing.expect(found_inner);
+}
+
+test "explorer: java parser ignores comments and leading annotations" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/Annotated.java",
+        \\// class Fake {}
+        \\/*
+        \\interface Ghost {}
+        \\*/
+        \\@Deprecated
+        \\public class Annotated {
+        \\    @Override public String toString() {
+        \\        return "}";
+        \\    }
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/Annotated.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    var class_count: usize = 0;
+    var method_count: usize = 0;
+    var found_fake = false;
+    var found_ghost = false;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .class_def and std.mem.eql(u8, sym.name, "Annotated")) class_count += 1;
+        if (sym.kind == .method and std.mem.eql(u8, sym.name, "toString")) method_count += 1;
+        if (std.mem.eql(u8, sym.name, "Fake")) found_fake = true;
+        if (std.mem.eql(u8, sym.name, "Ghost")) found_ghost = true;
+    }
+
+    try testing.expectEqual(@as(usize, 1), class_count);
+    try testing.expectEqual(@as(usize, 1), method_count);
+    try testing.expect(!found_fake);
+    try testing.expect(!found_ghost);
+    try testing.expectEqual(@as(usize, 2), outline.symbols.items.len);
+}
+
+test "explorer: java parser ignores braces inside text blocks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/TextBlocks.java",
+        \\public class TextBlocks {
+        \\    public void render() {
+        \\        String tpl = """
+        \\            { not_a_scope_brace }
+        \\        """;
+        \\    }
+        \\
+        \\    public void after() {}
+        \\    static class NextType {}
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/TextBlocks.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    var found_render = false;
+    var found_after = false;
+    var found_next_type = false;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .method and std.mem.eql(u8, sym.name, "render")) found_render = true;
+        if (sym.kind == .method and std.mem.eql(u8, sym.name, "after")) found_after = true;
+        if (sym.kind == .class_def and std.mem.eql(u8, sym.name, "NextType")) found_next_type = true;
+    }
+    try testing.expect(found_render);
+    try testing.expect(found_after);
+    try testing.expect(found_next_type);
+}
+
+test "explorer: java parser supports dollar signs in identifiers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/DollarNames.java",
+        \\public class DollarNames {
+        \\    private static final int OUTER$INNER = 1;
+        \\    public void run$Task() {}
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/DollarNames.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    var found_constant = false;
+    var found_method = false;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .constant and std.mem.eql(u8, sym.name, "OUTER$INNER")) found_constant = true;
+        if (sym.kind == .method and std.mem.eql(u8, sym.name, "run$Task")) found_method = true;
+    }
+    try testing.expect(found_constant);
+    try testing.expect(found_method);
+}
+
+test "explorer: java parser keeps wildcard imports package-level" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/Wildcards.java",
+        \\import foo.bar.*;
+        \\import static foo.util.Constants.*;
+        \\public class Wildcards {}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/Wildcards.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try testing.expectEqual(@as(usize, 2), outline.imports.items.len);
+    try testing.expectEqualStrings("foo.bar.*", outline.imports.items[0]);
+    try testing.expectEqualStrings("foo.util.Constants.*", outline.imports.items[1]);
+
+    const imported_by_file = try explorer.getImportedBy("foo/bar.java", testing.allocator);
+    defer {
+        for (imported_by_file) |path| testing.allocator.free(path);
+        testing.allocator.free(imported_by_file);
+    }
+    try testing.expectEqual(@as(usize, 0), imported_by_file.len);
+
+    const imported_by_pkg = try explorer.getImportedBy("foo.bar.*", testing.allocator);
+    defer {
+        for (imported_by_pkg) |path| testing.allocator.free(path);
+        testing.allocator.free(imported_by_pkg);
+    }
+    try testing.expectEqual(@as(usize, 1), imported_by_pkg.len);
+    try testing.expectEqualStrings("src/com/acme/Wildcards.java", imported_by_pkg[0]);
+
+    const imported_by_static_pkg = try explorer.getImportedBy("foo.util.Constants.*", testing.allocator);
+    defer {
+        for (imported_by_static_pkg) |path| testing.allocator.free(path);
+        testing.allocator.free(imported_by_static_pkg);
+    }
+    try testing.expectEqual(@as(usize, 1), imported_by_static_pkg.len);
+    try testing.expectEqualStrings("src/com/acme/Wildcards.java", imported_by_static_pkg[0]);
+}
+
+test "explorer: java parser marks junit methods as test declarations" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/ServiceTest.java",
+        \\import org.junit.jupiter.api.Test;
+        \\import org.junit.jupiter.params.ParameterizedTest;
+        \\public class ServiceTest {
+        \\    @Test
+        \\    void runs() {}
+        \\
+        \\    @ParameterizedTest
+        \\    void parameterizedCase() {}
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/ServiceTest.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    var test_count: usize = 0;
+    var found_runs = false;
+    var found_parameterized = false;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .test_decl) {
+            test_count += 1;
+            if (std.mem.eql(u8, sym.name, "runs")) found_runs = true;
+            if (std.mem.eql(u8, sym.name, "parameterizedCase")) found_parameterized = true;
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 2), test_count);
+    try testing.expect(found_runs);
+    try testing.expect(found_parameterized);
+}
+
+test "explorer: java parser treats interface fields as constants" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/Config.java",
+        \\public interface Config {
+        \\    int PORT = 8080;
+        \\    String NAME = "codedb";
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/Config.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    var found_port = false;
+    var found_name = false;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .constant and std.mem.eql(u8, sym.name, "PORT")) found_port = true;
+        if (sym.kind == .constant and std.mem.eql(u8, sym.name, "NAME")) found_name = true;
+    }
+
+    try testing.expect(found_port);
+    try testing.expect(found_name);
+}
+
+test "explorer: java parser handles multi-line method signatures with annotations" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/MultiLine.java",
+        \\public class MultiLine {
+        \\    @Deprecated
+        \\    public String
+        \\    render(
+        \\        String input,
+        \\        int count
+        \\    ) {
+        \\        return input + count;
+        \\    }
+        \\
+        \\    @org.junit.jupiter.api.Test
+        \\    void
+        \\    verifies(
+        \\    ) {}
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/MultiLine.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    var found_render = false;
+    var found_verifies_test = false;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .method and std.mem.eql(u8, sym.name, "render")) found_render = true;
+        if (sym.kind == .test_decl and std.mem.eql(u8, sym.name, "verifies")) found_verifies_test = true;
+    }
+
+    try testing.expect(found_render);
+    try testing.expect(found_verifies_test);
+}
+
+test "explorer: java parser tolerates unterminated text blocks and block comments" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/Broken.java",
+        \\public class Broken {
+        \\    public void before() {}
+        \\    String text = """
+        \\        this never closes
+        \\}
+    );
+    try explorer.indexFile("src/com/acme/BrokenComments.java",
+        \\public class BrokenComments {
+        \\    /* unterminated
+        \\    public void ghost() {}
+        \\}
+    );
+
+    var broken = (try explorer.getOutline("src/com/acme/Broken.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer broken.deinit();
+    var broken_comments = (try explorer.getOutline("src/com/acme/BrokenComments.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer broken_comments.deinit();
+
+    var found_before = false;
+    var found_ghost = false;
+    for (broken.symbols.items) |sym| {
+        if (sym.kind == .method and std.mem.eql(u8, sym.name, "before")) found_before = true;
+    }
+    for (broken_comments.symbols.items) |sym| {
+        if (std.mem.eql(u8, sym.name, "ghost")) found_ghost = true;
+    }
+
+    try testing.expect(found_before);
+    try testing.expect(!found_ghost);
+}
+
 // ── Version tests ───────────────────────────────────────────
 
 test "file versions: append and latest" {
@@ -1864,6 +2225,13 @@ test "isCommentOrBlank: cpp block and line comments" {
     try testing.expect(!isCommentOrBlank("  int x = 0;", .cpp));
 }
 
+test "isCommentOrBlank: java comments" {
+    try testing.expect(isCommentOrBlank("  // java line comment", .java));
+    try testing.expect(isCommentOrBlank("  /* java block comment */", .java));
+    try testing.expect(isCommentOrBlank("  * java continued block comment", .java));
+    try testing.expect(!isCommentOrBlank("  public class Main {", .java));
+}
+
 test "isCommentOrBlank: tabs and mixed whitespace" {
     try testing.expect(isCommentOrBlank("\t\t// tabbed comment", .zig));
     try testing.expect(isCommentOrBlank(" \t \t ", .zig));
@@ -2020,6 +2388,7 @@ test "detectLanguage: all supported extensions" {
     try testing.expect(explore.detectLanguage("comp.tsx") == .typescript);
     try testing.expect(explore.detectLanguage("main.rs") == .rust);
     try testing.expect(explore.detectLanguage("main.go") == .go_lang);
+    try testing.expect(explore.detectLanguage("Main.java") == .java);
     try testing.expect(explore.detectLanguage("README.md") == .markdown);
     try testing.expect(explore.detectLanguage("pkg.json") == .json);
     try testing.expect(explore.detectLanguage("config.yaml") == .yaml);
@@ -3529,6 +3898,8 @@ test "issue-59: telemetry writes session, tool, and codebase stats ndjson" {
     defer explorer.deinit();
     try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
     try explorer.indexFile("src/lib.py", "def run():\n    return 1\n");
+    try explorer.indexFile("src/App.php", "<?php\nclass App {}\n");
+    try explorer.indexFile("src/Main.java", "public class Main {}\n");
 
     telem.recordCodebaseStats(&explorer, 42);
     telem.flush();
@@ -3544,7 +3915,7 @@ test "issue-59: telemetry writes session, tool, and codebase stats ndjson" {
     try testing.expect(std.mem.indexOf(u8, contents, "\"tool\":\"codedb_status\"") != null);
     try testing.expect(std.mem.indexOf(u8, contents, "\"event_type\":\"codebase_stats\"") != null);
     try testing.expect(std.mem.indexOf(u8, contents, "\"startup_time_ms\":42") != null);
-    try testing.expect(std.mem.indexOf(u8, contents, "\"languages\":[\"zig\",\"python\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "\"languages\":[\"zig\",\"python\",\"php\",\"java\"]") != null);
 }
 
 test "issue-60: telemetry disabled path is a no-op" {
