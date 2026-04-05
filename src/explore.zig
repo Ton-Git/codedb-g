@@ -1622,12 +1622,14 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
 
     fn javaImportToPath(allocator: std.mem.Allocator, import_body: []const u8) ![]u8 {
         var path = std.mem.trim(u8, import_body, " \t");
-        if (std.mem.endsWith(u8, path, ".*")) return try allocator.dupe(u8, path);
         if (startsWith(path, "static ")) {
             path = std.mem.trimLeft(u8, path[7..], " \t");
+            if (std.mem.endsWith(u8, path, ".*")) return try allocator.dupe(u8, path);
             if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot| {
                 path = path[0..dot];
             }
+        } else if (std.mem.endsWith(u8, path, ".*")) {
+            return try allocator.dupe(u8, path);
         }
 
         var buf: std.ArrayList(u8) = .{};
