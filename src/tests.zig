@@ -879,7 +879,7 @@ test "explorer: typescript parser" {
     try testing.expect(outline.symbols.items.len >= 3);
 }
 
-test "explorer: java parser detects imports class methods and constants" {
+test "explorer: java parser detects imports, classes, methods, and constants" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var explorer = Explorer.init(arena.allocator());

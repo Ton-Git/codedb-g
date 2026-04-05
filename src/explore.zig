@@ -1355,7 +1355,7 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
     const JavaParseState = struct {
         in_block_comment: bool = false,
         brace_depth: i32 = 0,
-        type_stack: std.ArrayList(JavaTypeContext) = .{},
+        type_stack: std.ArrayListUnmanaged(JavaTypeContext) = .{},
         pending_type_name: ?[]const u8 = null,
 
         fn deinit(self: *JavaParseState, allocator: std.mem.Allocator) void {
