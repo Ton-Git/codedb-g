@@ -1582,7 +1582,7 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
                 }
                 continue;
             }
-            if (ch == '"' or ch == 39) {
+            if (ch == '"' or ch == '\'') {
                 in_string = ch;
                 continue;
             }
