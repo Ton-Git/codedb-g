@@ -1003,6 +1003,85 @@ test "explorer: java parser ignores comments and leading annotations" {
     try testing.expectEqual(@as(usize, 2), outline.symbols.items.len);
 }
 
+test "explorer: java parser ignores braces inside text blocks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/TextBlocks.java",
+        \\public class TextBlocks {
+        \\    public void render() {
+        \\        String tpl = """
+        \\            { not_a_scope_brace }
+        \\        """;
+        \\    }
+        \\
+        \\    public void after() {}
+        \\}
+        \\
+        \\public class NextType {}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/TextBlocks.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    var found_render = false;
+    var found_after = false;
+    var found_next_type = false;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .method and std.mem.eql(u8, sym.name, "render")) found_render = true;
+        if (sym.kind == .method and std.mem.eql(u8, sym.name, "after")) found_after = true;
+        if (sym.kind == .class_def and std.mem.eql(u8, sym.name, "NextType")) found_next_type = true;
+    }
+    try testing.expect(found_render);
+    try testing.expect(found_after);
+    try testing.expect(found_next_type);
+}
+
+test "explorer: java parser supports dollar signs in identifiers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/DollarNames.java",
+        \\public class DollarNames {
+        \\    private static final int OUTER$INNER = 1;
+        \\    public void run$Task() {}
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/DollarNames.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    var found_constant = false;
+    var found_method = false;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .constant and std.mem.eql(u8, sym.name, "OUTER$INNER")) found_constant = true;
+        if (sym.kind == .method and std.mem.eql(u8, sym.name, "run$Task")) found_method = true;
+    }
+    try testing.expect(found_constant);
+    try testing.expect(found_method);
+}
+
+test "explorer: java parser keeps wildcard imports package-level" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/Wildcards.java",
+        \\import foo.bar.*;
+        \\import static foo.util.Constants.*;
+        \\public class Wildcards {}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/Wildcards.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try testing.expectEqual(@as(usize, 2), outline.imports.items.len);
+    try testing.expectEqualStrings("foo.bar.*", outline.imports.items[0]);
+    try testing.expectEqualStrings("static foo.util.Constants.*", outline.imports.items[1]);
+}
+
 // ── Version tests ───────────────────────────────────────────
 
 test "file versions: append and latest" {

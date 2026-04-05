@@ -1354,6 +1354,7 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
 
     const JavaParseState = struct {
         in_block_comment: bool = false,
+        in_text_block: bool = false,
         brace_depth: i32 = 0,
         type_stack: std.ArrayListUnmanaged(JavaTypeContext) = .{},
         pending_type_name: ?[]const u8 = null,
@@ -1572,6 +1573,13 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
                 }
                 continue;
             }
+            if (state.in_text_block) {
+                if (ch == '"' and i + 2 < line.len and line[i + 1] == '"' and line[i + 2] == '"') {
+                    state.in_text_block = false;
+                    i += 2;
+                }
+                continue;
+            }
             if (in_string != 0) {
                 if (escaped) {
                     escaped = false;
@@ -1580,6 +1588,11 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
                 } else if (ch == in_string) {
                     in_string = 0;
                 }
+                continue;
+            }
+            if (ch == '"' and i + 2 < line.len and line[i + 1] == '"' and line[i + 2] == '"') {
+                state.in_text_block = true;
+                i += 2;
                 continue;
             }
             if (ch == '"' or ch == '\'') {
@@ -1609,15 +1622,13 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
 
     fn javaImportToPath(allocator: std.mem.Allocator, import_body: []const u8) ![]u8 {
         var path = std.mem.trim(u8, import_body, " \t");
+        if (std.mem.endsWith(u8, path, ".*")) return try allocator.dupe(u8, path);
         if (startsWith(path, "static ")) {
             path = std.mem.trimLeft(u8, path[7..], " \t");
-            if (std.mem.endsWith(u8, path, ".*")) {
-                path = path[0 .. path.len - 2];
-            } else if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot| {
+            if (std.mem.endsWith(u8, path, ".*")) return try allocator.dupe(u8, path);
+            if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot| {
                 path = path[0..dot];
             }
-        } else if (std.mem.endsWith(u8, path, ".*")) {
-            path = path[0 .. path.len - 2];
         }
 
         var buf: std.ArrayList(u8) = .{};
@@ -2290,11 +2301,11 @@ const JavaIdentSpan = struct {
 fn javaLastIdentifierSpan(s: []const u8) ?JavaIdentSpan {
     if (s.len == 0) return null;
     var end = s.len;
-    while (end > 0 and !(std.ascii.isAlphanumeric(s[end - 1]) or s[end - 1] == '_')) : (end -= 1) {}
+    while (end > 0 and !(std.ascii.isAlphanumeric(s[end - 1]) or s[end - 1] == '_' or s[end - 1] == '$')) : (end -= 1) {}
     if (end == 0) return null;
 
     var start = end;
-    while (start > 0 and (std.ascii.isAlphanumeric(s[start - 1]) or s[start - 1] == '_')) : (start -= 1) {}
+    while (start > 0 and (std.ascii.isAlphanumeric(s[start - 1]) or s[start - 1] == '_' or s[start - 1] == '$')) : (start -= 1) {}
     return .{
         .name = s[start..end],
         .start = start,
