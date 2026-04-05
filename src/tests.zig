@@ -1080,6 +1080,21 @@ test "explorer: java parser keeps wildcard imports package-level" {
     try testing.expectEqual(@as(usize, 2), outline.imports.items.len);
     try testing.expectEqualStrings("foo.bar.*", outline.imports.items[0]);
     try testing.expectEqualStrings("static foo.util.Constants.*", outline.imports.items[1]);
+
+    const imported_by_file = try explorer.getImportedBy("foo/bar.java", testing.allocator);
+    defer {
+        for (imported_by_file) |path| testing.allocator.free(path);
+        testing.allocator.free(imported_by_file);
+    }
+    try testing.expectEqual(@as(usize, 0), imported_by_file.len);
+
+    const imported_by_pkg = try explorer.getImportedBy("foo.bar.*", testing.allocator);
+    defer {
+        for (imported_by_pkg) |path| testing.allocator.free(path);
+        testing.allocator.free(imported_by_pkg);
+    }
+    try testing.expectEqual(@as(usize, 1), imported_by_pkg.len);
+    try testing.expectEqualStrings("src/com/acme/Wildcards.java", imported_by_pkg[0]);
 }
 
 // ── Version tests ───────────────────────────────────────────
