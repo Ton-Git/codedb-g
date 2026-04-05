@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 const Store = @import("store.zig").Store;
 const AgentRegistry = @import("agent.zig").AgentRegistry;
 const Explorer = @import("explore.zig").Explorer;
@@ -88,6 +89,12 @@ fn mainImpl() !void {
     // Handle --version early (no root needed)
     if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v") or std.mem.eql(u8, cmd, "version")) {
         out.p("codedb 0.2.53\n", .{});
+        return;
+    }
+
+    // Handle --help early (no root needed)
+    if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "help")) {
+        printUsage(out, s);
         return;
     }
 
@@ -559,7 +566,7 @@ fn getDataDir(allocator: std.mem.Allocator, abs_root: []const u8) ![]u8 {
     };
     defer allocator.free(home);
     const dir = try std.fmt.allocPrint(allocator, "{s}/.codedb/projects/{x}", .{ home, hash });
-    std.fs.cwd().makePath(dir) catch |err| {
+    compat.makePath(std.fs.cwd(), dir) catch |err| {
         std.log.warn("could not create data dir {s}: {}", .{ dir, err });
     };
     return dir;
