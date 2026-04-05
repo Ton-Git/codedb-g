@@ -1350,6 +1350,7 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
     const JavaTypeContext = struct {
         name: []const u8,
         depth: i32,
+        kind: SymbolKind,
     };
 
     const JavaParseState = struct {
@@ -1358,11 +1359,14 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
         brace_depth: i32 = 0,
         type_stack: std.ArrayListUnmanaged(JavaTypeContext) = .{},
         pending_type_name: ?[]const u8 = null,
+        pending_decl: std.ArrayListUnmanaged(u8) = .{},
+        pending_decl_start_line: ?u32 = null,
 
         fn deinit(self: *JavaParseState, allocator: std.mem.Allocator) void {
             for (self.type_stack.items) |ctx| allocator.free(ctx.name);
             self.type_stack.deinit(allocator);
             if (self.pending_type_name) |name| allocator.free(name);
+            self.pending_decl.deinit(allocator);
         }
 
         fn currentTypeName(self: *const JavaParseState) ?[]const u8 {
@@ -1370,8 +1374,23 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
             return self.type_stack.items[self.type_stack.items.len - 1].name;
         }
 
+        fn currentTypeKind(self: *const JavaParseState) ?SymbolKind {
+            if (self.type_stack.items.len == 0) return null;
+            return self.type_stack.items[self.type_stack.items.len - 1].kind;
+        }
+
+        fn currentTypeDepth(self: *const JavaParseState) ?i32 {
+            if (self.type_stack.items.len == 0) return null;
+            return self.type_stack.items[self.type_stack.items.len - 1].depth;
+        }
+
         fn inType(self: *const JavaParseState) bool {
             return self.type_stack.items.len > 0;
+        }
+
+        fn atTypeTopLevel(self: *const JavaParseState) bool {
+            const depth = self.currentTypeDepth() orelse return false;
+            return self.brace_depth == depth;
         }
 
         fn setPendingType(self: *JavaParseState, allocator: std.mem.Allocator, name: []const u8) !void {
@@ -1379,19 +1398,31 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
             self.pending_type_name = try allocator.dupe(u8, name);
         }
 
-        fn activatePendingType(self: *JavaParseState, allocator: std.mem.Allocator) !void {
+        fn activatePendingType(self: *JavaParseState, allocator: std.mem.Allocator, kind: SymbolKind) !void {
             const name = self.pending_type_name orelse return;
             self.pending_type_name = null;
             try self.type_stack.append(allocator, .{
                 .name = name,
                 .depth = self.brace_depth,
+                .kind = kind,
             });
+        }
+
+        fn appendPendingDecl(self: *JavaParseState, allocator: std.mem.Allocator, line: []const u8, line_num: u32) !void {
+            if (self.pending_decl.items.len == 0) self.pending_decl_start_line = line_num;
+            if (self.pending_decl.items.len > 0) try self.pending_decl.append(allocator, ' ');
+            try self.pending_decl.appendSlice(allocator, line);
+        }
+
+        fn clearPendingDecl(self: *JavaParseState) void {
+            self.pending_decl.clearRetainingCapacity();
+            self.pending_decl_start_line = null;
         }
 
         fn popCompletedTypes(self: *JavaParseState, allocator: std.mem.Allocator) void {
             while (self.type_stack.items.len > 0 and self.type_stack.items[self.type_stack.items.len - 1].depth > self.brace_depth) {
-                const name = self.type_stack.pop().name;
-                allocator.free(name);
+                const ctx = self.type_stack.pop() orelse break;
+                allocator.free(ctx.name);
             }
         }
     };
@@ -1441,43 +1472,56 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
             return;
         }
 
-        if (self.javaMatchType(line)) |match| {
+        const should_buffer = state.pending_decl.items.len > 0 or javaShouldBufferDeclaration(line, state);
+        const decl_line = if (should_buffer) blk: {
+            try state.appendPendingDecl(a, line, line_num);
+            break :blk state.pending_decl.items;
+        } else line;
+        const decl_line_num = state.pending_decl_start_line orelse line_num;
+
+        if (self.javaMatchType(decl_line)) |match| {
             const name_copy = try a.dupe(u8, match.name);
             errdefer a.free(name_copy);
-            const detail_copy = try a.dupe(u8, line);
+            const detail_copy = try a.dupe(u8, decl_line);
             errdefer a.free(detail_copy);
             try outline.symbols.append(a, .{
                 .name = name_copy,
                 .kind = match.kind,
-                .line_start = line_num,
+                .line_start = decl_line_num,
                 .line_end = line_num,
                 .detail = detail_copy,
             });
             try state.setPendingType(a, match.name);
-        } else if (self.javaMatchConstant(line, state)) |name| {
+            state.clearPendingDecl();
+        } else if (self.javaMatchConstant(decl_line, state)) |name| {
             const name_copy = try a.dupe(u8, name);
             errdefer a.free(name_copy);
-            const detail_copy = try a.dupe(u8, line);
+            const detail_copy = try a.dupe(u8, decl_line);
             errdefer a.free(detail_copy);
             try outline.symbols.append(a, .{
                 .name = name_copy,
                 .kind = .constant,
-                .line_start = line_num,
+                .line_start = decl_line_num,
                 .line_end = line_num,
                 .detail = detail_copy,
             });
-        } else if (self.javaMatchMethod(line, state)) |name| {
+            state.clearPendingDecl();
+        } else if (self.javaMatchMethod(decl_line, state)) |name| {
             const name_copy = try a.dupe(u8, name);
             errdefer a.free(name_copy);
-            const detail_copy = try a.dupe(u8, line);
+            const detail_copy = try a.dupe(u8, decl_line);
             errdefer a.free(detail_copy);
+            const kind: SymbolKind = if (javaHasTestAnnotation(decl_line)) .test_decl else .method;
             try outline.symbols.append(a, .{
                 .name = name_copy,
-                .kind = .method,
-                .line_start = line_num,
+                .kind = kind,
+                .line_start = decl_line_num,
                 .line_end = line_num,
                 .detail = detail_copy,
             });
+            state.clearPendingDecl();
+        } else if (should_buffer and javaLineEndsDeclaration(line) and !javaShouldContinueBufferedDeclaration(state.pending_decl.items)) {
+            state.clearPendingDecl();
         }
 
         try self.javaUpdateBraceState(line, state);
@@ -1522,13 +1566,22 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
     }
 
     fn javaMatchConstant(_: *Explorer, line: []const u8, state: *const JavaParseState) ?[]const u8 {
-        if (!state.inType()) return null;
+        if (!state.atTypeTopLevel()) return null;
         const has_static_final = startsWith(line, "static final ") or
             startsWith(line, "public static final ") or
             startsWith(line, "protected static final ") or
             startsWith(line, "private static final ") or
             std.mem.indexOf(u8, line, " static final ") != null;
-        if (!has_static_final) return null;
+
+        const is_interface_field = blk: {
+            if (state.currentTypeKind() != .interface_def) break :blk false;
+            if (std.mem.indexOfScalar(u8, line, '=') == null) break :blk false;
+            if (std.mem.indexOfScalar(u8, line, '(') != null) break :blk false;
+            const stripped = javaStripLeadingAnnotationsAndModifiers(line);
+            if (startsWith(stripped, "class ") or startsWith(stripped, "interface ") or startsWith(stripped, "enum ") or startsWith(stripped, "record ") or startsWith(stripped, "@interface ")) break :blk false;
+            break :blk true;
+        };
+        if (!has_static_final and !is_interface_field) return null;
 
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse std.mem.indexOfScalar(u8, line, ';') orelse return null;
         const before = std.mem.trimRight(u8, line[0..eq], " \t");
@@ -1538,7 +1591,7 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
     }
 
     fn javaMatchMethod(_: *Explorer, line: []const u8, state: *const JavaParseState) ?[]const u8 {
-        if (!state.inType()) return null;
+        if (!state.atTypeTopLevel()) return null;
         const stripped = javaStripLeadingAnnotationsAndModifiers(line);
         if (stripped.len == 0) return null;
         if (startsWith(stripped, "class ") or startsWith(stripped, "interface ") or startsWith(stripped, "enum ") or startsWith(stripped, "record ") or startsWith(stripped, "@interface ")) return null;
@@ -1611,7 +1664,13 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
             if (ch == '{') {
                 state.brace_depth += 1;
                 if (state.pending_type_name != null) {
-                    try state.activatePendingType(self.allocator);
+                    const type_kind = if (self.javaMatchType(state.pending_decl.items)) |match|
+                        match.kind
+                    else if (self.javaMatchType(line)) |match|
+                        match.kind
+                    else
+                        .class_def;
+                    try state.activatePendingType(self.allocator, type_kind);
                 }
             } else if (ch == '}') {
                 state.brace_depth -= 1;
@@ -2426,6 +2485,61 @@ fn javaIsMethodRejectPrefix(prefix: []const u8) bool {
     if (std.mem.indexOf(u8, trimmed, "->") != null or std.mem.indexOf(u8, trimmed, "::") != null) return true;
     if (javaLastIdentifierSpan(trimmed)) |span| {
         return javaIsControlWord(span.name);
+    }
+    return false;
+}
+
+fn javaShouldBufferDeclaration(line: []const u8, state: *const Explorer.JavaParseState) bool {
+    if (line.len == 0) return false;
+    if (state.in_text_block or state.in_block_comment) return false;
+    if (startsWith(line, "@") and !startsWith(line, "@interface ")) return true;
+
+    const stripped = javaStripLeadingAnnotationsAndModifiers(line);
+    if (state.pending_decl.items.len > 0) return true;
+
+    if (std.mem.indexOfScalar(u8, line, '(') != null and std.mem.indexOfAny(u8, line, "{;") == null) return true;
+    if (std.mem.indexOfScalar(u8, stripped, '=') != null and std.mem.indexOfAny(u8, line, "{;") == null) return true;
+    if (startsWith(stripped, "class ") or startsWith(stripped, "interface ") or startsWith(stripped, "enum ") or startsWith(stripped, "record ") or startsWith(stripped, "@interface ")) {
+        return std.mem.indexOfScalar(u8, line, '{') == null;
+    }
+
+    if (state.inType()) {
+        if (std.mem.indexOfScalar(u8, line, '(') == null and std.mem.indexOfAny(u8, line, "{;=") == null) return true;
+        if (std.mem.indexOfScalar(u8, line, '(') != null and std.mem.indexOfAny(u8, line, "{;") == null) return true;
+    }
+
+    return false;
+}
+
+fn javaLineEndsDeclaration(line: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, line, '{') != null and std.mem.indexOf(u8, line, "\"\"\"") == null) return true;
+    return std.mem.indexOfScalar(u8, line, ';') != null;
+}
+
+fn javaShouldContinueBufferedDeclaration(buffer: []const u8) bool {
+    const trimmed = std.mem.trimRight(u8, buffer, " \t");
+    if (trimmed.len == 0) return false;
+    const annotation_pos = std.mem.lastIndexOfScalar(u8, trimmed, '@') orelse return false;
+    const tail = trimmed[annotation_pos..];
+    if (std.mem.indexOfScalar(u8, tail, '(') != null and std.mem.indexOfScalar(u8, tail, ')') == null) return true;
+    if (std.mem.indexOfAny(u8, tail, "{;") == null) return true;
+    return false;
+}
+
+fn javaHasTestAnnotation(line: []const u8) bool {
+    if (std.mem.indexOf(u8, line, "@org.junit.jupiter.") != null) return true;
+    if (std.mem.indexOf(u8, line, "@org.junit.") != null) return true;
+
+    const annotations = [_][]const u8{
+        "@ParameterizedTest",
+        "@RepeatedTest",
+        "@TestFactory",
+        "@TestTemplate",
+        "@Property",
+        "@Test",
+    };
+    for (annotations) |annotation| {
+        if (std.mem.indexOf(u8, line, annotation) != null) return true;
     }
     return false;
 }

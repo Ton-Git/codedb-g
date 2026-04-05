@@ -1017,9 +1017,8 @@ test "explorer: java parser ignores braces inside text blocks" {
         \\    }
         \\
         \\    public void after() {}
+        \\    static class NextType {}
         \\}
-        \\
-        \\public class NextType {}
     );
 
     var outline = (try explorer.getOutline("src/com/acme/TextBlocks.java", testing.allocator)) orelse return error.TestUnexpectedResult;
@@ -1103,6 +1102,142 @@ test "explorer: java parser keeps wildcard imports package-level" {
     }
     try testing.expectEqual(@as(usize, 1), imported_by_static_pkg.len);
     try testing.expectEqualStrings("src/com/acme/Wildcards.java", imported_by_static_pkg[0]);
+}
+
+test "explorer: java parser marks junit methods as test declarations" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/ServiceTest.java",
+        \\import org.junit.jupiter.api.Test;
+        \\import org.junit.jupiter.params.ParameterizedTest;
+        \\public class ServiceTest {
+        \\    @Test
+        \\    void runs() {}
+        \\
+        \\    @ParameterizedTest
+        \\    void parameterizedCase() {}
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/ServiceTest.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    var test_count: usize = 0;
+    var found_runs = false;
+    var found_parameterized = false;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .test_decl) {
+            test_count += 1;
+            if (std.mem.eql(u8, sym.name, "runs")) found_runs = true;
+            if (std.mem.eql(u8, sym.name, "parameterizedCase")) found_parameterized = true;
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 2), test_count);
+    try testing.expect(found_runs);
+    try testing.expect(found_parameterized);
+}
+
+test "explorer: java parser treats interface fields as constants" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/Config.java",
+        \\public interface Config {
+        \\    int PORT = 8080;
+        \\    String NAME = "codedb";
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/Config.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    var found_port = false;
+    var found_name = false;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .constant and std.mem.eql(u8, sym.name, "PORT")) found_port = true;
+        if (sym.kind == .constant and std.mem.eql(u8, sym.name, "NAME")) found_name = true;
+    }
+
+    try testing.expect(found_port);
+    try testing.expect(found_name);
+}
+
+test "explorer: java parser handles multi-line method signatures with annotations" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/MultiLine.java",
+        \\public class MultiLine {
+        \\    @Deprecated
+        \\    public String
+        \\    render(
+        \\        String input,
+        \\        int count
+        \\    ) {
+        \\        return input + count;
+        \\    }
+        \\
+        \\    @org.junit.jupiter.api.Test
+        \\    void
+        \\    verifies(
+        \\    ) {}
+        \\}
+    );
+
+    var outline = (try explorer.getOutline("src/com/acme/MultiLine.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    var found_render = false;
+    var found_verifies_test = false;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .method and std.mem.eql(u8, sym.name, "render")) found_render = true;
+        if (sym.kind == .test_decl and std.mem.eql(u8, sym.name, "verifies")) found_verifies_test = true;
+    }
+
+    try testing.expect(found_render);
+    try testing.expect(found_verifies_test);
+}
+
+test "explorer: java parser tolerates unterminated text blocks and block comments" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/com/acme/Broken.java",
+        \\public class Broken {
+        \\    public void before() {}
+        \\    String text = """
+        \\        this never closes
+        \\}
+    );
+    try explorer.indexFile("src/com/acme/BrokenComments.java",
+        \\public class BrokenComments {
+        \\    /* unterminated
+        \\    public void ghost() {}
+        \\}
+    );
+
+    var broken = (try explorer.getOutline("src/com/acme/Broken.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer broken.deinit();
+    var broken_comments = (try explorer.getOutline("src/com/acme/BrokenComments.java", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer broken_comments.deinit();
+
+    var found_before = false;
+    var found_ghost = false;
+    for (broken.symbols.items) |sym| {
+        if (sym.kind == .method and std.mem.eql(u8, sym.name, "before")) found_before = true;
+    }
+    for (broken_comments.symbols.items) |sym| {
+        if (std.mem.eql(u8, sym.name, "ghost")) found_ghost = true;
+    }
+
+    try testing.expect(found_before);
+    try testing.expect(!found_ghost);
 }
 
 // ── Version tests ───────────────────────────────────────────
