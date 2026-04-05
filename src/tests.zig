@@ -987,13 +987,19 @@ test "explorer: java parser ignores comments and leading annotations" {
 
     var class_count: usize = 0;
     var method_count: usize = 0;
+    var found_fake = false;
+    var found_ghost = false;
     for (outline.symbols.items) |sym| {
         if (sym.kind == .class_def and std.mem.eql(u8, sym.name, "Annotated")) class_count += 1;
         if (sym.kind == .method and std.mem.eql(u8, sym.name, "toString")) method_count += 1;
+        if (std.mem.eql(u8, sym.name, "Fake")) found_fake = true;
+        if (std.mem.eql(u8, sym.name, "Ghost")) found_ghost = true;
     }
 
     try testing.expectEqual(@as(usize, 1), class_count);
     try testing.expectEqual(@as(usize, 1), method_count);
+    try testing.expect(!found_fake);
+    try testing.expect(!found_ghost);
     try testing.expectEqual(@as(usize, 2), outline.symbols.items.len);
 }
 
